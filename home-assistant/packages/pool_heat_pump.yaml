@@ -1,0 +1,213 @@
+# Pool heat pump (Aqua Temp): cloud control, status sensors and a switch.
+#
+# Whether it runs on solar is decided by packages/solar_surplus.yaml, using the
+# "on at" (default 95%) / "off below" (default 90%) battery levels below and
+# the "Pool heat pump solar control" switch.
+#
+# Talks to the Aqua Temp (Linked-Go) cloud, the same API as the phone app.
+# Needs in secrets.yaml:
+#   aquatemp_login_payload: '{"userName":"<e-mail>","password":"<md5 of password>","type":"2"}'
+#   aquatemp_device_code: <deviceCode from aquatemp_test.py>
+
+input_boolean:
+  pool_hp_solar_control:
+    name: Pool heat pump solar control
+    icon: mdi:solar-power
+
+input_number:
+  pool_hp_on_soc:
+    name: Pool heat pump on at battery
+    min: 50
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-up
+  pool_hp_off_soc:
+    name: Pool heat pump off below battery
+    min: 50
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-down
+
+input_text:
+  aquatemp_token:
+    name: Aqua Temp cloud token
+    max: 255
+    mode: password
+
+rest_command:
+  aquatemp_login:
+    url: https://cloud.linked-go.com:449/crmservice/api/app/user/login
+    method: post
+    content_type: "application/json; charset=utf-8"
+    payload: !secret aquatemp_login_payload
+    timeout: 20
+  aquatemp_data:
+    url: https://cloud.linked-go.com:449/crmservice/api/app/device/getDataByCode
+    method: post
+    content_type: "application/json; charset=utf-8"
+    headers:
+      x-token: "{{ token }}"
+    payload: '{"deviceCode":"{{ device }}","protocalCodes":["Power","Mode","T02","T03","T05","R02"]}'
+    timeout: 20
+  aquatemp_control:
+    url: https://cloud.linked-go.com:449/crmservice/api/app/device/control
+    method: post
+    content_type: "application/json; charset=utf-8"
+    headers:
+      x-token: "{{ token }}"
+    payload: '{"param":[{"deviceCode":"{{ device }}","protocolCode":"Power","value":"{{ value }}"}]}'
+    timeout: 20
+
+script:
+  aquatemp_call:
+    alias: Aqua Temp cloud call
+    description: Calls the Aqua Temp cloud with the cached token, logging in again when it is missing or expired.
+    mode: queued
+    fields:
+      command:
+        description: "data or control"
+      value:
+        description: "Power value for control: 1 or 0"
+    sequence:
+      - variables:
+          device: !secret aquatemp_device_code
+      - repeat:
+          count: 2
+          sequence:
+            - if: "{{ states('input_text.aquatemp_token') in ['', 'unknown', 'unavailable'] }}"
+              then:
+                - action: rest_command.aquatemp_login
+                  response_variable: login
+                - variables:
+                    login_body: "{{ login.content if login.content is mapping else login.content | from_json }}"
+                - if: "{{ login_body.error_code | string != '0' }}"
+                  then:
+                    - stop: "Aqua Temp login failed: {{ login_body.error_msg }}"
+                      error: true
+                - action: input_text.set_value
+                  target:
+                    entity_id: input_text.aquatemp_token
+                  data:
+                    value: "{{ login_body.objectResult['x-token'] }}"
+            - action: "rest_command.aquatemp_{{ command }}"
+              data:
+                token: "{{ states('input_text.aquatemp_token') }}"
+                device: "{{ device }}"
+                value: "{{ value | default('') }}"
+              response_variable: resp
+            - variables:
+                body: "{{ resp.content if resp.content is mapping else resp.content | from_json }}"
+            - if: "{{ body.error_code | string == '0' }}"
+              then:
+                - stop: ok
+                  response_variable: body
+            # Token expired or rejected: clear it so the next pass logs in again.
+            - action: input_text.set_value
+              target:
+                entity_id: input_text.aquatemp_token
+              data:
+                value: ""
+      - stop: "Aqua Temp {{ command }} call failed: {{ body.error_msg }}"
+        error: true
+
+  aquatemp_refresh:
+    alias: Aqua Temp refresh status
+    mode: single
+    sequence:
+      - action: script.aquatemp_call
+        data:
+          command: data
+        response_variable: resp
+      - variables:
+          vals: >
+            {% set ns = namespace(d={}) %}
+            {% for i in resp.objectResult %}{% set ns.d = dict(ns.d, **{i.code: i.value}) %}{% endfor %}
+            {{ ns.d }}
+      - event: aquatemp_status
+        event_data:
+          power: "{{ vals.Power }}"
+          mode: "{{ vals.Mode }}"
+          water_in: "{{ vals.T02 }}"
+          water_out: "{{ vals.T03 }}"
+          ambient: "{{ vals.T05 }}"
+          setpoint: "{{ vals.R02 }}"
+
+  pool_heat_pump_set_power:
+    alias: Pool heat pump switch on/off
+    mode: queued
+    fields:
+      power:
+        description: true = on, false = off
+        selector:
+          boolean:
+    sequence:
+      - action: script.aquatemp_call
+        data:
+          command: control
+          value: "{{ '1' if power else '0' }}"
+        response_variable: resp
+      - delay: 5
+      - action: script.aquatemp_refresh
+
+template:
+  - triggers:
+      - trigger: event
+        event_type: aquatemp_status
+    binary_sensor:
+      - name: Pool heat pump power
+        unique_id: pool_hp_power
+        device_class: power
+        state: "{{ trigger.event.data.power | string == '1' }}"
+    sensor:
+      - name: Pool heat pump water in
+        unique_id: pool_hp_water_in
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ trigger.event.data.water_in }}"
+      - name: Pool heat pump water out
+        unique_id: pool_hp_water_out
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ trigger.event.data.water_out }}"
+      - name: Pool heat pump ambient
+        unique_id: pool_hp_ambient
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ trigger.event.data.ambient }}"
+      - name: Pool heat pump setpoint
+        unique_id: pool_hp_setpoint
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ trigger.event.data.setpoint }}"
+  - switch:
+      - name: Pool heat pump
+        unique_id: pool_hp_switch
+        icon: mdi:heat-pump
+        state: "{{ is_state('binary_sensor.pool_heat_pump_power', 'on') }}"
+        availability: "{{ states('binary_sensor.pool_heat_pump_power') in ['on', 'off'] }}"
+        turn_on:
+          - action: script.pool_heat_pump_set_power
+            data:
+              power: true
+        turn_off:
+          - action: script.pool_heat_pump_set_power
+            data:
+              power: false
+
+automation:
+  - id: pool_heat_pump_refresh
+    alias: Pool heat pump refresh status
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/2"
+    actions:
+      - action: script.aquatemp_refresh

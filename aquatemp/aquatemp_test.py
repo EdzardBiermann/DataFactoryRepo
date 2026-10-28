@@ -8,7 +8,8 @@ it logs in, lists your heat pumps and prints their current status.
     python aquatemp_test.py --power on      # switch on, then read back
     python aquatemp_test.py --power off --device <deviceCode>
 
-Credentials: env vars AQUATEMP_USER / AQUATEMP_PASS, otherwise you are prompted.
+Credentials, first found wins: env vars AQUATEMP_USER / AQUATEMP_PASS, the
+.env file next to this script (copy .env.example), otherwise you are prompted.
 """
 
 import argparse
@@ -134,6 +135,20 @@ def print_status(api, dev):
     return values
 
 
+def load_config():
+    """Read KEY=VALUE lines from the .env file next to this script, if present."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    config = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip().strip("\"'")
+    return config
+
+
 def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -142,9 +157,14 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="print raw API responses")
     args = parser.parse_args()
     VERBOSE = args.verbose
+    # The cloud returns some error messages in Chinese; don't crash on a cp1252 console.
+    sys.stdout.reconfigure(errors="replace")
 
-    user = os.environ.get("AQUATEMP_USER") or input("Aqua Temp e-mail: ").strip()
-    password = os.environ.get("AQUATEMP_PASS") or getpass.getpass("Aqua Temp password: ")
+    config = load_config()
+    user = (os.environ.get("AQUATEMP_USER") or config.get("AQUATEMP_USER")
+            or input("Aqua Temp e-mail: ").strip())
+    password = (os.environ.get("AQUATEMP_PASS") or config.get("AQUATEMP_PASS")
+                or getpass.getpass("Aqua Temp password: "))
 
     api = AquaTemp()
     api.login(user, password)

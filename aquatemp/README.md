@@ -21,8 +21,12 @@ pkg install python && pip install requests
 python aquatemp_test.py
 ```
 
-Log in with the same e-mail and password you use in the Aqua Temp app. You can also set
-`AQUATEMP_USER` / `AQUATEMP_PASS` instead. The credentials are never saved.
+Use the same e-mail and password as the Aqua Temp app. The script takes them from, in order:
+
+1. the `AQUATEMP_USER` / `AQUATEMP_PASS` environment variables,
+2. a `.env` file next to the script: copy `.env.example` to `.env` and fill it in
+   (`.env` is in `.gitignore`, so it is never pushed),
+3. a prompt, if neither is set.
 
 ## Expected output
 
@@ -39,8 +43,7 @@ Device Pool  code=XXXXXXXX  status=ONLINE  product=...
 
 If any step fails, rerun with `--verbose` and share the raw responses. Remove the token first.
 
-## Alternative: test in Home Assistant
+## Home Assistant
 
-1. Install HACS, then add the **Aqua Temp** integration from it.
-2. Log in with your app account.
-3. Toggle the climate entity it creates and check that the app follows.
+[`../home-assistant/packages/pool_heat_pump.yaml`](../home-assistant/packages/pool_heat_pump.yaml)
+uses the same API to give Home Assistant a `switch.pool_heat_pump` and temperature sensors.

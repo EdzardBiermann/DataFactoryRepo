@@ -1,0 +1,438 @@
+# Solar surplus manager for the two geysers and the pool heat pump.
+#
+# Daytime (09:00-17:00): when the battery is nearly full and not discharging,
+# switch extra loads on one at a time, in priority order
+#   1. Salon geyser  2. Huis geyser  3. Pool heat pump
+# and switch the last one off again when the battery has to help.
+# The inverter runs zero export, so once the battery is full it throttles the
+# solar down to the load: the only way to find spare solar is to add a load and
+# watch whether the battery starts discharging.
+# Only loads this manager switched on itself (flags input_boolean.solar_*) are
+# switched off again by it; anything switched on by hand is left alone.
+#
+# Mornings: each geyser is heated to its ready temperature just in time for
+# its hot-water time. Salon is also kept at the ready temperature until
+# closing time on weekdays.
+#
+# Any time: while the inverter load stays above 13 kW, loads are shed
+# (pool, Salon, Huis) and nothing is switched on again for 10 minutes.
+#
+# "Geysers on leave" keeps both geyser elements off.
+
+input_boolean:
+  geysers_on_leave:
+    name: Geysers on leave
+    icon: mdi:airplane
+  solar_salon_geyser:
+    name: Salon geyser on solar
+    icon: mdi:solar-power
+  solar_huis_geyser:
+    name: Huis geyser on solar
+    icon: mdi:solar-power
+  solar_pool_heat_pump:
+    name: Pool heat pump on solar
+    icon: mdi:solar-power
+
+input_number:
+  geyser_solar_on_soc:
+    name: Geysers solar on at battery
+    min: 80
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-up
+  geyser_solar_max_temp:
+    name: Geysers solar max temperature
+    min: 50
+    max: 75
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-high
+  huis_geyser_ready_temp:
+    name: Huis geyser ready temperature
+    min: 40
+    max: 65
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-water
+  salon_geyser_ready_temp:
+    name: Salon geyser ready temperature
+    min: 40
+    max: 65
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-water
+
+input_datetime:
+  huis_geyser_hot_by:
+    name: Huis geyser hot by
+    has_date: false
+    has_time: true
+  salon_geyser_hot_by:
+    name: Salon geyser hot by (weekdays)
+    has_date: false
+    has_time: true
+  salon_closes:
+    name: Salon closes (weekdays)
+    has_date: false
+    has_time: true
+
+# Battery power jumps around with every kettle and fridge, so decisions use
+# sensor.battery_power_3_min_average (positive = charging, negative =
+# discharging). It is a Statistics helper (Settings > Helpers), not YAML:
+# source sensor.deye_sunsynk_sol_ark_battery_power, characteristic
+# "average step", max age 3 minutes, sampling size 500, keep last sample.
+
+template:
+  - binary_sensor:
+      # Start time = hot-by time minus the heating time at 8 C/h (measured
+      # 12.5 C/h median, slower while the shower runs) plus 20 minutes.
+      - name: Huis geyser morning boost
+        unique_id: huis_geyser_morning_boost
+        icon: mdi:water-boiler
+        state: >
+          {%- set temp = states('sensor.1001771c61_t') -%}
+          {%- set ready = states('input_number.huis_geyser_ready_temp') | float(50) -%}
+          {%- set hot_by = today_at(states('input_datetime.huis_geyser_hot_by') if has_value('input_datetime.huis_geyser_hot_by') else '06:30') -%}
+          {%- if is_state('input_boolean.geysers_on_leave', 'on') or now() >= hot_by + timedelta(hours=1) -%}
+            false
+          {%- elif not is_number(temp) -%}
+            {{ this.state == 'on' or (now() >= hot_by - timedelta(minutes=90) and now() < hot_by) }}
+          {%- elif this.state == 'on' -%}
+            {{ temp | float < ready + 2 }}
+          {%- else -%}
+            {{ temp | float < ready and now() >= hot_by - timedelta(hours=(ready - temp | float) / 8 + 0.33) }}
+          {%- endif -%}
+
+      # Weekdays: hot by opening time, then kept at the ready temperature until
+      # closing. Heating time at 4 C/h (slowest measured 3.4 C/h with clients
+      # using water) plus 20 minutes.
+      - name: Salon geyser morning boost
+        unique_id: salon_geyser_morning_boost
+        icon: mdi:water-boiler
+        state: >
+          {%- set temp = states('sensor.100178e9de_t') -%}
+          {%- set ready = states('input_number.salon_geyser_ready_temp') | float(50) -%}
+          {%- set hot_by = today_at(states('input_datetime.salon_geyser_hot_by') if has_value('input_datetime.salon_geyser_hot_by') else '07:30') -%}
+          {%- set closes = today_at(states('input_datetime.salon_closes') if has_value('input_datetime.salon_closes') else '17:00') -%}
+          {%- if is_state('input_boolean.geysers_on_leave', 'on') or now().weekday() >= 5 or now() >= closes -%}
+            false
+          {%- elif not is_number(temp) -%}
+            {{ this.state == 'on' or (now() >= hot_by - timedelta(minutes=90) and now() < hot_by) }}
+          {%- elif this.state == 'on' -%}
+            {{ temp | float < ready + 2 }}
+          {%- else -%}
+            {{ temp | float < ready and now() >= hot_by - timedelta(hours=(ready - temp | float) / 4 + 0.33) }}
+          {%- endif -%}
+
+      - name: Solar surplus battery discharging
+        unique_id: solar_surplus_battery_discharging
+        icon: mdi:battery-minus
+        state: "{{ states('sensor.battery_power_3_min_average') | float(states('sensor.deye_sunsynk_sol_ark_battery_power') | float(0)) < -1000 }}"
+
+automation:
+  - id: solar_surplus_manager
+    alias: Solar surplus manager
+    description: Switches the geysers and the pool heat pump on and off with the spare solar.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+    conditions:
+      - condition: time
+        after: "09:00:00"
+        before: "17:00:00"
+      - "{{ is_number(states('sensor.deye_sunsynk_sol_ark_battery_state_of_charge')) }}"
+    actions:
+      - variables:
+          soc: "{{ states('sensor.deye_sunsynk_sol_ark_battery_state_of_charge') | float }}"
+          batt: "{{ states('sensor.battery_power_3_min_average') | float(states('sensor.deye_sunsynk_sol_ark_battery_power') | float(0)) }}"
+          load: "{{ states('sensor.deye_sunsynk_sol_ark_load_power') | float(0) }}"
+          discharging: "{{ is_state('binary_sensor.solar_surplus_battery_discharging', 'on') }}"
+          leave: "{{ is_state('input_boolean.geysers_on_leave', 'on') }}"
+          geyser_on_soc: "{{ states('input_number.geyser_solar_on_soc') | float(97) }}"
+          max_temp: "{{ states('input_number.geyser_solar_max_temp') | float(65) }}"
+          pool_on_soc: "{{ states('input_number.pool_hp_on_soc') | float(95) }}"
+          pool_off_soc: "{{ states('input_number.pool_hp_off_soc') | float(90) }}"
+          pool_enabled: "{{ is_state('input_boolean.pool_hp_solar_control', 'on') }}"
+          adding_allowed: "{{ now().hour < 16 }}"
+          overload_ok: "{% set lt = state_attr('automation.inverter_overload_protection', 'last_triggered') %}{{ lt is none or (now() - lt).total_seconds() > 600 }}"
+          # Never add a load that would take the inverter (16 kW) above this.
+          max_load: 12000
+          # Priority order. Geyser watts measured from the load steps; pool assumed.
+          stages:
+            - name: Salon geyser
+              entity: switch.100178e9de
+              flag: input_boolean.solar_salon_geyser
+              temp: sensor.100178e9de_t
+              watts: 3400
+            - name: Huis geyser
+              entity: switch.1001771c61
+              flag: input_boolean.solar_huis_geyser
+              temp: sensor.1001771c61_t
+              watts: 2200
+            - name: Pool heat pump
+              entity: switch.pool_heat_pump
+              flag: input_boolean.solar_pool_heat_pump
+              watts: 3000
+      - variables:
+          decision: >
+            {%- set ns = namespace(rows=[], last_action=999) -%}
+            {%- for s in stages -%}
+              {%- set st = expand(s.entity) | first | default(none) -%}
+              {%- set fl = expand(s.flag) | first | default(none) -%}
+              {%- set state = st.state if st is not none else 'unavailable' -%}
+              {%- set age = (now() - st.last_changed).total_seconds() / 60 if st is not none else 0 -%}
+              {%- if fl is not none -%}
+                {%- set ns.last_action = [ns.last_action, (now() - fl.last_changed).total_seconds() / 60] | min -%}
+              {%- endif -%}
+              {%- if s.temp is defined -%}
+                {%- set t = states(s.temp) -%}
+                {%- set limit = max_temp if state == 'on' else max_temp - 3 -%}
+                {%- set row = dict(s, state=state, age=age, flagged=is_state(s.flag, 'on'), managed=true,
+                                   wants=not leave and (not is_number(t) or t | float < limit),
+                                   start_soc=geyser_on_soc, stop_soc=geyser_on_soc - 5, min_off=10, min_on=0) -%}
+              {%- else -%}
+                {%- set row = dict(s, state=state, age=age, flagged=is_state(s.flag, 'on'), managed=pool_enabled,
+                                   wants=pool_enabled, start_soc=pool_on_soc, stop_soc=pool_off_soc, min_off=15, min_on=10) -%}
+              {%- endif -%}
+              {%- set ns.rows = ns.rows + [row] -%}
+            {%- endfor -%}
+            {%- set d = namespace(op='none', entity='', flag='', reason='') -%}
+            {#- 1. Undo what this manager switched on, once it is no longer wanted. -#}
+            {%- for r in ns.rows -%}
+              {%- if d.op == 'none' and r.flagged and r.managed and r.state == 'on' -%}
+                {%- if not r.wants -%}
+                  {%- set d.op = 'off' -%}{%- set d.entity = r.entity -%}{%- set d.flag = r.flag -%}
+                  {%- set d.reason = r.name ~ (': leave mode' if leave else ': hot enough') -%}
+                {%- elif soc < r.stop_soc -%}
+                  {%- set d.op = 'off' -%}{%- set d.entity = r.entity -%}{%- set d.flag = r.flag -%}
+                  {%- set d.reason = r.name ~ ': battery ' ~ soc | int ~ '% is below ' ~ r.stop_soc | int ~ '%' -%}
+                {%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {#- 2. The battery has to help: switch off the lowest-priority load we added. -#}
+            {%- set ours = ns.rows | selectattr('flagged') | selectattr('managed') | selectattr('state', 'eq', 'on') | list -%}
+            {%- if d.op == 'none' and discharging and ours and ns.last_action >= 3 -%}
+              {%- set r = ours | last -%}
+              {%- if r.age >= r.min_on -%}
+                {%- set d.op = 'off' -%}{%- set d.entity = r.entity -%}{%- set d.flag = r.flag -%}
+                {%- set d.reason = r.name ~ ': battery discharging ' ~ (-batt) | int ~ ' W' -%}
+              {%- endif -%}
+            {%- endif -%}
+            {#- 3. Spare solar: switch on the next load in priority order. -#}
+            {%- set candidates = ns.rows | selectattr('managed') | selectattr('wants') | selectattr('state', 'eq', 'off') | list -%}
+            {%- if d.op == 'none' and adding_allowed and overload_ok and not discharging and batt >= -300
+                  and ns.last_action >= 5 and candidates -%}
+              {%- set r = candidates | first -%}
+              {%- if soc >= r.start_soc and r.age >= r.min_off and load + r.watts <= max_load -%}
+                {%- set d.op = 'on' -%}{%- set d.entity = r.entity -%}{%- set d.flag = r.flag -%}
+                {%- set d.reason = r.name ~ ': battery ' ~ soc | int ~ '%, load ' ~ load | int ~ ' W' -%}
+              {%- endif -%}
+            {%- endif -%}
+            {{- {'op': d.op, 'entity': d.entity, 'flag': d.flag, 'reason': d.reason} -}}
+      - if: "{{ decision.op == 'on' }}"
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: "{{ decision.flag }}"
+          - action: switch.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ decision.entity }}"
+          - action: logbook.log
+            data:
+              name: Solar surplus
+              message: "switched on ({{ decision.reason }})"
+              entity_id: "{{ decision.entity }}"
+      - if: "{{ decision.op == 'off' }}"
+        then:
+          - action: switch.turn_off
+            continue_on_error: true
+            target:
+              entity_id: "{{ decision.entity }}"
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ decision.flag }}"
+          - action: logbook.log
+            data:
+              name: Solar surplus
+              message: "switched off ({{ decision.reason }})"
+              entity_id: "{{ decision.entity }}"
+
+  - id: solar_surplus_end_of_day
+    alias: Solar surplus end of day
+    description: Switches off whatever the solar surplus manager switched on.
+    triggers:
+      - trigger: time
+        at: "17:00:00"
+    actions:
+      - repeat:
+          for_each:
+            - switch: switch.100178e9de
+              flag: input_boolean.solar_salon_geyser
+            - switch: switch.1001771c61
+              flag: input_boolean.solar_huis_geyser
+            - switch: switch.pool_heat_pump
+              flag: input_boolean.solar_pool_heat_pump
+          sequence:
+            - if: "{{ is_state(repeat.item.flag, 'on') }}"
+              then:
+                - action: switch.turn_off
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item.switch }}"
+                - action: input_boolean.turn_off
+                  target:
+                    entity_id: "{{ repeat.item.flag }}"
+
+  - id: solar_surplus_clear_flags
+    alias: Solar surplus clear flags
+    description: Forgets a load as "on solar" once it is off, however it was switched off.
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: switch.100178e9de
+        to: "off"
+        id: input_boolean.solar_salon_geyser
+      - trigger: state
+        entity_id: switch.1001771c61
+        to: "off"
+        id: input_boolean.solar_huis_geyser
+      - trigger: state
+        entity_id: switch.pool_heat_pump
+        to: "off"
+        id: input_boolean.solar_pool_heat_pump
+    conditions:
+      - "{{ is_state(trigger.id, 'on') }}"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: "{{ trigger.id }}"
+
+  - id: inverter_overload_protection
+    alias: Inverter overload protection
+    description: Sheds the pool heat pump and geysers while the inverter load stays above 13 kW.
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.deye_sunsynk_sol_ark_load_power
+        above: 13000
+        for:
+          seconds: 10
+    actions:
+      - repeat:
+          sequence:
+            - variables:
+                shed: "{{ (['switch.pool_heat_pump', 'switch.100178e9de', 'switch.1001771c61'] | select('is_state', 'on') | list + ['none']) | first }}"
+            - if: "{{ shed == 'none' }}"
+              then:
+                - stop: Nothing left to switch off
+            - action: switch.turn_off
+              continue_on_error: true
+              target:
+                entity_id: "{{ shed }}"
+            - action: logbook.log
+              data:
+                name: Inverter overload
+                message: "switched off at {{ states('sensor.deye_sunsynk_sol_ark_load_power') }} W load"
+                entity_id: "{{ shed }}"
+            - delay:
+                seconds: 15
+          until:
+            - "{{ states('sensor.deye_sunsynk_sol_ark_load_power') | float(0) < 12000 }}"
+
+  - id: geyser_morning_boost
+    alias: Geyser morning boost
+    description: Heats each geyser to its ready temperature in time for its hot-water time.
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.huis_geyser_morning_boost
+          - binary_sensor.salon_geyser_morning_boost
+        from: ["on", "off"]
+        to: ["on", "off"]
+        id: boost_changed
+      - trigger: time_pattern
+        minutes: "/5"
+        id: tick
+    variables:
+      overload_ok: "{% set lt = state_attr('automation.inverter_overload_protection', 'last_triggered') %}{{ lt is none or (now() - lt).total_seconds() > 600 }}"
+    actions:
+      - repeat:
+          for_each:
+            - name: Huis geyser
+              boost: binary_sensor.huis_geyser_morning_boost
+              geyser: switch.1001771c61
+              flag: input_boolean.solar_huis_geyser
+              temp: sensor.1001771c61_t
+            - name: Salon geyser
+              boost: binary_sensor.salon_geyser_morning_boost
+              geyser: switch.100178e9de
+              flag: input_boolean.solar_salon_geyser
+              temp: sensor.100178e9de_t
+          sequence:
+            - choose:
+                - conditions: "{{ is_state(repeat.item.boost, 'on') and is_state(repeat.item.geyser, 'off') and overload_ok }}"
+                  sequence:
+                    - action: switch.turn_on
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item.geyser }}"
+                    - action: logbook.log
+                      data:
+                        name: Geyser boost
+                        message: "switched on ({{ repeat.item.name }} at {{ states(repeat.item.temp) }} °C)"
+                        entity_id: "{{ repeat.item.geyser }}"
+                - conditions: >
+                    {{ trigger.id == 'boost_changed' and trigger.entity_id == repeat.item.boost
+                       and trigger.to_state.state == 'off' and is_state(repeat.item.geyser, 'on')
+                       and not is_state(repeat.item.flag, 'on') }}
+                  sequence:
+                    - if:
+                        # Hand over to the solar surplus manager when there is spare solar.
+                        - "{{ now().hour >= 9 and now().hour < 16 and not is_state('input_boolean.geysers_on_leave', 'on') }}"
+                        - "{{ states('sensor.deye_sunsynk_sol_ark_battery_state_of_charge') | float(0) >= states('input_number.geyser_solar_on_soc') | float(97) }}"
+                        - "{{ is_state('binary_sensor.solar_surplus_battery_discharging', 'off') }}"
+                      then:
+                        - action: input_boolean.turn_on
+                          target:
+                            entity_id: "{{ repeat.item.flag }}"
+                      else:
+                        - action: switch.turn_off
+                          continue_on_error: true
+                          target:
+                            entity_id: "{{ repeat.item.geyser }}"
+                        - action: logbook.log
+                          data:
+                            name: Geyser boost
+                            message: "switched off ({{ repeat.item.name }} ready at {{ states(repeat.item.temp) }} °C)"
+                            entity_id: "{{ repeat.item.geyser }}"
+
+  - id: geysers_leave_mode
+    alias: Geysers leave mode
+    description: Keeps both geyser elements off while "Geysers on leave" is on.
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.geysers_on_leave
+        to: "on"
+      - trigger: state
+        entity_id:
+          - switch.1001771c61
+          - switch.100178e9de
+        to: "on"
+      - trigger: time_pattern
+        minutes: "/15"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.geysers_on_leave
+        state: "on"
+      - "{{ ['switch.1001771c61', 'switch.100178e9de'] | select('is_state', 'on') | list | count > 0 }}"
+    actions:
+      - action: switch.turn_off
+        continue_on_error: true
+        target:
+          entity_id: "{{ ['switch.1001771c61', 'switch.100178e9de'] | select('is_state', 'on') | list }}"
